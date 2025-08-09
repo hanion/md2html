@@ -41,6 +41,11 @@ typedef struct {
 	size_t capacity;
 } StringBuilder;
 
+typedef struct {
+	char* items;
+	size_t count;
+} StringView;
+
 bool read_entire_file(const char* filepath_cstr, StringBuilder* sb) {
 	bool result = true;
 
@@ -94,18 +99,28 @@ bool write_to_file(const char* filepath_cstr, StringBuilder* sb) {
 	return true;
 }
 
-void escape_html_and_append(StringBuilder* out, const char* line) {
-	for (const char* p = line; *p && *p != '\n'; ++p) {
-		switch (*p) {
-			case '<': da_append_cstr(out, "&lt;");  break;
-			case '>': da_append_cstr(out, "&gt;");  break;
-			case '&': da_append_cstr(out, "&amp;"); break;
-			default:  da_append(out, *p);           break;
+typedef struct {
+	StringBuilder* out;
+	const char* cursor;
+	bool in_paragraph;
+	bool in_list;
+} MdRenderer;
+
+void da_append_escape_html(StringBuilder* out, const char* in, size_t count) {
+	for (size_t i = 0; i < count; ++i) {
+		switch ((unsigned char)in[i]) {
+			case '<':  da_append_cstr(out, "&lt;");   break;
+			case '>':  da_append_cstr(out, "&gt;");   break;
+			case '&':  da_append_cstr(out, "&amp;");  break;
+			case '\'': da_append_cstr(out, "&#39;");  break;
+			case '"':  da_append_cstr(out, "&quot;"); break;
+			default:   da_append(out, in[i]);         break;
 		}
 	}
 }
 
 const char* search_str_until_newline(const char* haystack, const char* needle) {
+	if (!haystack) return NULL;
 	if (!*needle) return haystack;
 
 	const char* hay = haystack;
@@ -129,82 +144,95 @@ const char* search_str_until_newline(const char* haystack, const char* needle) {
 	return NULL;
 }
 
+size_t sv_strstr(StringView haystack, StringView needle) {
+	if (needle.count == 0) return 0;
+	if (haystack.count < needle.count) return haystack.count;
+
+	for (size_t i = 0; i <= haystack.count - needle.count; ++i) {
+		if (memcmp(haystack.items + i, needle.items, needle.count) == 0) {
+			return i;
+		}
+	}
+	return haystack.count;
+}
+
 bool starts_with(const char* line, const char* prefix) {
 	return strncmp(line, prefix, strlen(prefix)) == 0;
 }
+bool word_starts_with(const char* line, const char* prefix) {
+	size_t len = strlen(prefix);
+	return strncmp(line, prefix, len) == 0 && (*(line+len) != ' ');
+}
+const char* word_ends_with(const char* line, const char* prefix) {
+	const char* end = search_str_until_newline(line, prefix);
+	if (end && (*(end-1) == ' ')) return NULL;
+	return end;
+}
 
-void parse_inline(const char* line, StringBuilder* out) {
+void parse_inline(MdRenderer* r, const char* line) {
+
+#define PARSE_INLINE_TAG(start, end, html_start, html_end)             \
+	else if (word_starts_with(p, start)) {                             \
+		size_t start_len = sizeof(start) - 1;                          \
+		size_t end_len   = sizeof(end) - 1;                            \
+		const char* tag_end = word_ends_with(p + start_len, end);      \
+		if (tag_end) {                                                 \
+			p += start_len;                                            \
+			da_append_cstr(r->out, html_start);                        \
+			da_append_escape_html(r->out, p, tag_end - p);             \
+			da_append_cstr(r->out, html_end);                          \
+			p = tag_end + end_len;                                     \
+			continue;                                                  \
+		}                                                              \
+	}
+
 	const char* p = line;
 	while (*p && *p != '\n') {
-		if (starts_with(p, "***")) {
+		// double space line break
+		if (p[0] == ' ' && p[1] == ' ' && p[2] == '\n') {
+			da_append_cstr(r->out, "<br>\n");
 			p += 3;
-			const char* end = search_str_until_newline(p, "***");
-			if (!end) break;
-			da_append_cstr(out, "<strong><i>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</i></strong>");
-			p = end + 3;
-		} else if (starts_with(p, "_**")) {
-			p += 3;
-			const char* end = search_str_until_newline(p, "**_");
-			if (!end) break;
-			da_append_cstr(out, "<strong><i>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</i></strong>");
-			p = end + 3;
-		} else if (starts_with(p, "**_")) {
-			p += 3;
-			const char* end = search_str_until_newline(p, "_**");
-			if (!end) break;
-			da_append_cstr(out, "<strong><i>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</i></strong>");
-			p = end + 3;
-		} else if (starts_with(p, "**")) {
-			p += 2;
-			const char* end = search_str_until_newline(p, "**");
-			if (!end) break;
-			da_append_cstr(out, "<strong>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</strong>");
-			p = end + 2;
-		} else if (*p == '*' || *p == '_') {
-			char marker = *p++;
-			const char* end;
-			if (marker == '*') end = search_str_until_newline(p, "*");
-			if (marker == '_') end = search_str_until_newline(p, "_");
-			if (!end) break;
-			da_append_cstr(out, "<i>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</i>");
-			p = end + 1;
-		} else if (*p == '`') {
-			++p;
-			const char* end = search_str_until_newline(p, "`");
-			if (!end) break;
-			da_append_cstr(out, "<code>");
-			da_append_many(out, p, end - p);
-			da_append_cstr(out, "</code>");
-			p = end + 1;
-		} else if (*p == '[') {
+			break;
+		}
+
+		if (false) {}
+		PARSE_INLINE_TAG("***", "***", "<strong><i>", "</i></strong>")
+		PARSE_INLINE_TAG("**_", "_**", "<strong><i>", "</i></strong>")
+		PARSE_INLINE_TAG("_**", "**_", "<strong><i>", "</i></strong>")
+		PARSE_INLINE_TAG("**", "**", "<strong>", "</strong>")
+		PARSE_INLINE_TAG("*", "*", "<i>", "</i>")
+		PARSE_INLINE_TAG("_", "_", "<i>", "</i>")
+		PARSE_INLINE_TAG("`", "`", "<code>", "</code>")
+		PARSE_INLINE_TAG("\\(", "\\)", "\\(", "\\)")
+		else if (*p == '[') {
 			const char* end_text = search_str_until_newline(p, "]");
 			if (!end_text || end_text[1] != '(') {
-				da_append_many(out, p, 1);
+				da_append_escape_html(r->out, p, 1);
 				++p;
 				continue;
 			}
 			const char* end_url = search_str_until_newline(end_text + 2, ")");
 			if (!end_url) break;
-			da_append_cstr(out, "<a href=\"");
-			da_append_many(out, end_text + 2, end_url - (end_text + 2));
-			da_append_cstr(out, "\">");
-			da_append_many(out, p + 1, end_text - (p + 1));
-			da_append_cstr(out, "</a>");
+			da_append_cstr(r->out, "<a href=\"");
+			da_append_many(r->out, end_text + 2, end_url - (end_text + 2));
+			da_append_cstr(r->out, "\">");
+			da_append_escape_html(r->out, p + 1, end_text - (p + 1));
+			da_append_cstr(r->out, "</a>");
 			p = end_url + 1;
-		} else {
-			da_append(out, *p);
-			++p;
+			continue;
 		}
+		else if (starts_with(p, "<?")) {
+			const char* tag_end = strstr(p + 2, "?>");
+			if (tag_end) {
+				da_append_many(r->out, p, tag_end - p + 2);
+				p = tag_end + 2;
+				r->cursor = p;
+				continue;
+			}
+		}
+
+		da_append(r->out, *p);
+		++p;
 	}
 }
 
@@ -227,75 +255,156 @@ void skip_after_newline(const char** cursor) {
 	}
 }
 
-void parse_file(const char* source, StringBuilder* out) {
-	const char* l = source;
-	bool started_paragraph = false;
-	while (*l) {
-		while (*l == '\t' || *l == ' ' || *l == '\n')
-			l++;
+void render_md_to_html(StringBuilder* md, StringBuilder* out) {
+	MdRenderer r = { .cursor = md->items, .out = out };
 
-		if (*l == '<') {
-			if (started_paragraph) {
-				da_append_cstr(out, "</p>\n");
-				started_paragraph = false;
+#define start_paragraph() if (!r.in_paragraph) { da_append_cstr(out,  "\n<p>\n"); r.in_paragraph = true; }
+#define   end_paragraph() if (r.in_paragraph)  { da_append_cstr(out, "</p>\n"); r.in_paragraph = false; }
+#define start_list() if (!r.in_list) { da_append_cstr(out,  "<ul>\n"); r.in_list = true; }
+#define   end_list() if (r.in_list)  { da_append_cstr(out, "</ul>\n"); r.in_list = false; }
+
+	while (*r.cursor) {
+		const char* line_end = r.cursor;
+		while (*line_end && *line_end != '\n') line_end++;
+
+		const char* trimmed = r.cursor;
+		while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+
+		// empty line ends paragraph
+		if (line_end - trimmed == 0) {
+			end_paragraph();
+			end_list();
+
+		} else if (starts_with(trimmed, "<?")) {
+			const char* end = strstr(trimmed + 2, "?>");
+			if (end) {
+				da_append_many(out, trimmed, end - trimmed + 2);
+				r.cursor = end + 2;
+				continue;
 			}
-			append_until_newline(out, l);
-		} else if (*l == '#') {
-			int level = 0;
-			while (*l == '#') {
-				level++;
-				l++;
+		
+		} else if (starts_with(trimmed, "---\n")) {
+			if (trimmed != md->items) {
+				da_append_cstr(out, "<hr>");
+				r.cursor = trimmed + 3;
+				continue;
 			}
-			while (*l == ' ') l++;
-			char tag[12];
-			sprintf(tag, "h%d", level);
-			da_append(out, '<');
-			da_append_cstr(out, tag);
-			da_append(out, '>');
-			parse_inline(l, out);
-			da_append_cstr(out, "</");
-			da_append_cstr(out, tag);
-			da_append_cstr(out, ">\n");
 
-		} else if (starts_with(l, "- [ ] ")) {
-			da_append_cstr(out, "<ul><li><input type=\"checkbox\" disabled>");
-			parse_inline(l + 6, out);
-			da_append_cstr(out, "</li></ul>\n");
+			/* frontmatter
+			const char* end = strstr(trimmed + 4, "---\n");
+			if (end) {
+				trimmed += 3;
+				da_append_cstr(out_fm, "<?");
+				da_append_many(out_fm, trimmed, end - trimmed);
+				da_append_cstr(out_fm, "?>\n");
+				r.cursor = end + 3;
+				continue;
+			}
+			*/
 
-		} else if (starts_with(l, "- ")) {
-			da_append_cstr(out, "<ul><li>");
-			parse_inline(l + 2, out);
-			da_append_cstr(out, "</li></ul>\n");
+		// HTML passthrough
+		} else if (*trimmed == '<') {
+			end_paragraph();
+			end_list();
 
-		} else if (*l != '\n' && *l != '\0') {
-			if (!started_paragraph) {
-				da_append_cstr(out, "<p>");
-				parse_inline(l, out);
-				started_paragraph = true;
+			const char* html_end_start = search_str_until_newline(trimmed, "</");
+			const char* html_end_end   = search_str_until_newline(html_end_start, ">");
+			if (!html_end_start || !html_end_end) {
+				append_until_newline(out, trimmed);
 			} else {
-				da_append(out, ' ');
-				parse_inline(l, out);
-
-				const char* temp = l;
-				skip_after_newline(&temp);
-				if (*temp == '\n') {
-					started_paragraph = false;
-					da_append_cstr(out, "</p>\n");
-				}
-				if (*temp == ' ' && *(temp + 1) == ' ') {
-					started_paragraph = false;
-					da_append_cstr(out, "</p>\n");
-				}
+				html_end_end++;
+				da_append_many(out, trimmed, html_end_end - trimmed);
+				r.cursor = html_end_end;
+				parse_inline(&r, html_end_end);
 			}
+
+		} else if (*trimmed == '#') {
+			end_paragraph();
+			end_list();
+
+			int level = 0;
+			while (*trimmed == '#') { level++; trimmed++; }
+			while (*trimmed == ' ') trimmed++;
+
+			char tag[16];
+			sprintf(tag, "h%d", level);
+			da_append_cstr(out, "\n<"); da_append_cstr(out, tag); da_append(out, '>');
+			parse_inline(&r, trimmed);
+			da_append_cstr(out, "</"); da_append_cstr(out, tag); da_append_cstr(out, ">\n");
+
+		} else if (starts_with(trimmed, "- [ ] ")) {
+			end_paragraph();
+			end_list();
+			da_append_cstr(out, "<ul><li><input type=\"checkbox\" disabled>");
+			parse_inline(&r, trimmed + 6);
+			da_append_cstr(out, "</li></ul>\n");
+
+		} else if (starts_with(trimmed, "- ")) {
+			end_paragraph();
+			start_list();
+			da_append_cstr(out, "<li>");
+			parse_inline(&r, trimmed + 2);
+			da_append_cstr(out, "</li>\n");
+
+		} else if (starts_with(trimmed, "> ")) {
+			end_paragraph();
+			end_list();
+			da_append_cstr(out, "<blockquote>");
+			parse_inline(&r, trimmed + 2);
+			da_append_cstr(out, "</blockquote>\n");
+
+		} else if (starts_with(trimmed, "```")) {
+			if (trimmed == md->items) {
+				/* frontmatter
+				const char* end = strstr(trimmed + 4, "```\n");
+				if (end) {
+					skip_after_newline(&trimmed);
+					da_append_cstr(out_fm, "<?");
+					da_append_many(out_fm, trimmed, end - trimmed);
+					da_append_cstr(out_fm, "?>\n");
+					r.cursor = end + 3;
+					continue;
+				}
+				*/
+			}
+
+			end_paragraph();
+			end_list();
+
+			const char* code_end = strstr(trimmed + 3, "```");
+			if (!code_end) code_end = md->items + md->count;
+
+			skip_after_newline(&trimmed); // skip language
+			da_append_cstr(out, "<pre><code>\n");
+			da_append_escape_html(out, trimmed, code_end - trimmed);
+			da_append_cstr(out, "</code></pre>\n");
+
+			r.cursor = code_end + 3;
+			continue;
+
+		} else {
+			end_list();
+			start_paragraph();
+			parse_inline(&r, trimmed);
+			da_append(out, '\n');
 		}
 
-		skip_after_newline(&l);
+		if (r.cursor > line_end) continue;
+		r.cursor = (*line_end == '\n') ? line_end + 1 : line_end;
 	}
-	if (started_paragraph) {
-		da_append_cstr(out, "</p>\n");
-		started_paragraph = false;
-	}
+
+	end_paragraph();
+	end_list();
+	da_append(out, '\0');
+
+#undef start_paragraph
+#undef   end_paragraph
+#undef start_list
+#undef   end_list
 }
+
+
+
 
 void print_usage(const char* prog_name) {
 	fprintf(stderr, "Usage: %s input.md [-o output.html]\n", prog_name);
@@ -335,7 +444,7 @@ int main(int argc, char** argv) {
 	if (!read_entire_file(input_path, &source)) return 1;
 
 	StringBuilder out = {0};
-	parse_file(source.items, &out);
+	render_md_to_html(&source, &out);
 	da_append(&out, '\0');
 
 	if (output_path) {
